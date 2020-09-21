@@ -1,4 +1,4 @@
-import asyncHooks from 'async_hooks'
+import { AsyncLocalStorage } from 'async_hooks'
 
 interface Pool<T extends Connection> {
     getConnection(): Promise<T>,
@@ -20,37 +20,23 @@ export class Conext<
     TPool extends Pool<TConnection>,
     TConnection extends Connection = PoolConnection<TPool>
 > {
-    private readonly context: {[eid: string]: { conn: TConnection, trx: number }} = {};
-
-    private asyncHooks: asyncHooks.AsyncHook;
+    private asyncLocalStorage: AsyncLocalStorage<{conn: TConnection, trx: number}>;
 
     constructor(private pool: TPool) {
-        this.asyncHooks = asyncHooks.createHook({
-            init: (asyncId, type, triggerAsyncId, resource) => {
-                if (this.context[triggerAsyncId]) {
-                    this.context[asyncId] = this.context[triggerAsyncId];
-                }
-            },
-            destroy: (asyncId) => {
-                delete this.context[asyncId];
-            }
-        }).enable();
+        this.asyncLocalStorage = new AsyncLocalStorage();
     }
 
     async connection<T>(callback: (conn: TConnection) => Promise<T>) {
-        const eid = asyncHooks.executionAsyncId();
-        if (this.context[eid]) {
-            return await callback(this.context[eid].conn);
+        const context = this.asyncLocalStorage.getStore();
+        if (context) {
+            return await callback(context.conn);
         }
         const conn = await this.pool.getConnection();
         try {
-            const eid = asyncHooks.executionAsyncId();
-            this.context[eid] = { conn: conn, trx: 0 };
-            try {
+            const context = { conn: conn, trx: 0 };
+            return await this.asyncLocalStorage.run(context, async () => {
                 return await callback(conn);
-            } finally {
-                delete this.context[eid];
-            }
+            });
         } finally {
             conn.release();
         }
@@ -58,9 +44,9 @@ export class Conext<
 
     async transaction<T>(callback: (conn: TConnection) => Promise<T>) {
         return await this.connection(async (conn) => {
-            const eid = asyncHooks.executionAsyncId();
-            if (this.context[eid].trx === 0) {
-                this.context[eid].trx++;
+            const context = this.asyncLocalStorage.getStore()!;
+            if (context.trx === 0) {
+                context.trx++;
                 await conn.beginTransaction();
                 try {
                     const ret = await callback(conn);
@@ -70,14 +56,14 @@ export class Conext<
                     await conn.rollback();
                     throw err;
                 } finally {
-                    this.context[eid].trx--;
+                    context.trx--;
                 }
             } else {
-                this.context[eid].trx++;
+                context.trx++;
                 try {
                     return await callback(conn);
                 } finally {
-                    this.context[eid].trx--;
+                    context.trx--;
                 }
             }
         });
@@ -87,7 +73,7 @@ export class Conext<
         try {
             return await this.pool.end();
         } finally {
-            this.asyncHooks.disable();
+            this.asyncLocalStorage.disable();
         }
     }
 }
